@@ -73,25 +73,35 @@ python -m tasks.eliminar.motor CARPETA
 
 ---
 
-## 📦 Crear el ejecutable (Windows)
+## 📦 Ejecutables y releases (Windows + Linux)
 
-kakoli se compila a un **único `.exe` nativo con [Nuitka](https://nuitka.net/)** (Python → C), sin necesidad de Python en la máquina destino. Requiere **Microsoft C++ Build Tools**.
+kakoli se compila a un **ejecutable nativo con [Nuitka](https://nuitka.net/)** (Python → C), sin necesidad de Python en la máquina destino, para **Windows x64** y **Linux x64**. La lógica de build y empaquetado está centralizada en [`build.py`](build.py) (fuente única, compartida por el CI y el build local).
 
-```powershell
-# Instala Nuitka en el entorno virtual del proyecto
-./.venv/Scripts/python.exe -m pip install nuitka
+**Release automático:** un tag de versión dispara el workflow [`.github/workflows/release.yml`](.github/workflows/release.yml), que compila en paralelo en Windows y Linux y publica **un solo GitHub Release** con ambos paquetes:
 
-# Compila (build limpio)
-.\build_nuitka.ps1 -Limpiar
+```bash
+git tag v1.8.0-alpha
+git push origin v1.8.0-alpha
+```
+```text
+kakoli-1.8.0-alpha-windows-x64.zip
+kakoli-1.8.0-alpha-linux-x64.tar.gz
 ```
 
-Resultado: `dist\kakoli.exe` (~10 MB). El script incluye las fuentes y los iconos, activa la optimización de enlace (LTO) y cachea la extracción del *onefile* por versión para que el arranque sea rápido también en equipos antiguos con disco mecánico. Detalles en [`BUILD_NUITKA.md`](BUILD_NUITKA.md).
+**Build local (Windows)** — requiere Microsoft C++ Build Tools:
+```powershell
+./.venv/Scripts/python.exe -m pip install nuitka tkinterdnd2
+.\build_nuitka.ps1 -Limpiar        # deja el .zip en dist\
+```
 
-### Linux
+**Build local (Linux)**:
+```bash
+sudo apt-get install -y python3-tk tk-dev patchelf
+python -m pip install nuitka tkinterdnd2
+python build.py                    # deja el .tar.gz en dist/
+```
 
-La app funciona en Linux **directamente desde el código** (`python kakoli.py`, con `python3-tk` instalado): las piezas específicas de Windows (barra de título propia, DPI, registro de la fuente, icono `.ico`) degradan solas.
-
-El **ejecutable de Linux** lo compila GitHub automáticamente con Nuitka (workflow [`.github/workflows/build-linux.yml`](.github/workflows/build-linux.yml)): al publicar un tag `vX.Y.Z` se adjunta el binario `kakoli-linux-x86_64` a la Release correspondiente. También puede lanzarse a mano desde la pestaña **Actions** (deja el binario como *artifact*).
+La app también corre en Linux **directamente desde el código** (`python kakoli.py`, con `python3-tk`): las piezas de Windows (barra de título propia, DPI, icono `.ico`) degradan solas. Más detalles en [`BUILD_NUITKA.md`](BUILD_NUITKA.md).
 
 > El icono `iconos/kakoli.ico` (multi‑resolución, 16→256) se genera del arte en `iconos/` con Pillow. Como es **pixel‑art**, los tamaños grandes (128 y 256) se reescalan con `NEAREST` para no emborronar los píxeles (así se ve nítido en la vista *Iconos grandes/muy grandes* del Explorador); los pequeños con `LANCZOS` para que sean legibles:
 > ```python

@@ -1,0 +1,91 @@
+name: Release
+
+# Sistema de build/release multiplataforma. Un único tag «vX.Y.Z» arranca:
+#   1) un build en paralelo para Windows y Linux (matriz), cada uno con Nuitka a
+#      través de build.py (fuente única de los flags y del empaquetado), y
+#   2) un job final que reúne los dos paquetes en UN solo GitHub Release.
+#
+# Resultado en la Release del tag:
+#   kakoli-<version>-windows-x64.zip
+#   kakoli-<version>-linux-x64.tar.gz
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:        # permite un ensayo manual (sin crear Release)
+
+permissions:
+  contents: write           # crear la Release y subir los assets
+
+jobs:
+  # ----------------------------------------------------------------- build
+  build:
+    strategy:
+      fail-fast: false      # que un fallo en una plataforma no cancele la otra
+      matrix:
+        include:
+          - os: windows-latest
+            plataforma: windows-x64
+          - os: ubuntu-latest
+            plataforma: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Dependencias del sistema en Linux (Tk + patchelf)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk tk-dev patchelf ccache
+
+      - name: Dependencias de Python (Nuitka + tkinterdnd2)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install nuitka tkinterdnd2
+
+      - name: Comprobar que Tkinter funciona
+        run: python -c "import tkinter; print('tkinter', tkinter.TkVersion)"
+
+      - name: Build + empaquetado (Nuitka)
+        run: python build.py --version "${{ github.ref_name }}"
+
+      - name: Subir el paquete como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: kakoli-${{ matrix.plataforma }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------- release
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')      # solo publica en un tag real
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reunir los paquetes de todas las plataformas
+        uses: actions/download-artifact@v4
+        with:
+          path: artefactos      # cada artefacto en artefactos/<nombre>/<archivo>
+
+      - name: Crear el Release con ambos paquetes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          # Pre-release si el tag lleva sufijo (p. ej. -alpha, -beta, -rc1).
+          PRERELEASE=""
+          case "${GITHUB_REF_NAME}" in *-*) PRERELEASE="--prerelease";; esac
+          ARCHIVOS=$(find artefactos -type f \( -name '*.zip' -o -name '*.tar.gz' \))
+          echo "Assets a publicar:"; echo "$ARCHIVOS"
+          gh release create "${GITHUB_REF_NAME}" $ARCHIVOS \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes $PRERELEASE \
+            || gh release upload "${GITHUB_REF_NAME}" $ARCHIVOS --clobber

@@ -1,5 +1,6 @@
 # Build de Nuitka
 build/
+build_out/
 dist/
 *.build/
 *.dist/
