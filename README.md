@@ -208,5 +208,3 @@ python bench.py --reanudar --todos      # pausar a la mitad, "cerrar" y reanudar
 
 - **Fuentes**: [Space Mono](fuentes/) bajo la SIL Open Font License (ver `fuentes/OFL.txt`).
 - **Autor**: [@franfjz](https://github.com/franfjz).
-
-> Los enlaces del pie de la app (autor y "invítame a un café") se configuran en `gui/constantes.py` (`URL_AUTOR`, `URL_CAFE`).
