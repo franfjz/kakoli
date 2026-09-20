@@ -1,0 +1,9 @@
+# Finales de línea consistentes: LF en el repositorio para todo el texto,
+# independientemente del sistema (evita el aviso "LF will be replaced by CRLF").
+* text=auto eol=lf
+
+# Archivos binarios: nunca normalizar finales de línea.
+*.png binary
+*.ico binary
+*.ttf binary
+*.otf binary

@@ -1,0 +1,1170 @@
+===============================================================================
+ ROADMAP DE RENDIMIENTO — Proyecto "Carpetas en ZIP anidados"
+ (motor_comprimir / motor_descomprimir / motor_eliminar / zip_anidado)
+===============================================================================
+
+OBJETIVO GENERAL
+  Que las tres tareas (comprimir, descomprimir, eliminar) se ejecuten con el
+  máximo rendimiento posible ADAPTÁNDOSE de forma AUTOMÁTICA a la máquina donde
+  corren, con especial cuidado en equipos antiguos: ligero, eficiente y sin
+  sobrecargar el sistema (que el ordenador siga usable mientras trabaja).
+
+ACLARACIÓN SOBRE "PUNTOS 5 Y 6"
+  Se corresponden con las mejoras ya anotadas en el docstring de
+  motor_comprimir.py:
+    - Punto 5 = Mejora 5: agrupar subárboles pequeños en un único ZIP.
+    - Punto 6 = Mejora 6: comprimir carpetas hermanas en paralelo.
+  Los ganchos ya están preparados en el código (Opciones.agrupar_*,
+  seleccionar_agrupados(), Comprimidor.crear_agrupado(), Planificador,
+  calcular_hilos(), Opciones.hilos). Este roadmap los completa y les añade el
+  auto-cálculo de hilos por CPU + RAM.
+
+
+-------------------------------------------------------------------------------
+ 0. DECISIONES CLAVE (leer antes de empezar)
+-------------------------------------------------------------------------------
+
+0.1  ¿Los hilos sirven de verdad en Python para esto? SÍ.
+     - La compresión/descompresión DEFLATE la hace zlib en C y LIBERA EL GIL
+       mientras trabaja. La E/S de disco (leer/escribir archivos) también lo
+       libera. Por tanto varios hilos comprimen en núcleos distintos de verdad:
+       no es "concurrencia de mentira", hay aceleración real de CPU.
+     - Excepción: los archivos ya comprimidos (.jpg, .mp4, .zip...) se guardan
+       con ZIP_STORED; ahí no hay trabajo de CPU, solo se solapa la E/S.
+     - Conclusión: se usa un pool de HILOS (threading), NO de procesos. Los
+       procesos duplicarían memoria y arranque, malo en equipos antiguos.
+
+0.2  El paralelismo depende de la FORMA del árbol, no solo de los núcleos.
+     El orden es post-orden (los hijos antes que los padres), así que en cada
+     momento solo se pueden comprimir a la vez las carpetas cuyos hijos ya están
+     listos. Árbol ANCHO (muchas carpetas hermanas) -> escala bien. Árbol
+     PROFUNDO y estrecho (cadena de carpetas con un hijo cada una) -> el
+     paralelismo efectivo tiende a 1 por mucho núcleo que haya. Esto es
+     inherente y hay que comunicarlo en la interfaz (no prometer 8x siempre).
+
+0.3  Disco: en HDD antiguos, leer/escribir en paralelo provoca "saltos" de
+     cabezal y puede ir MÁS LENTO que en secuencial. Por eso el auto-cálculo
+     es conservador, tiene tope y, si detectamos HDD, baja el número de hilos.
+
+0.4  RAM: el peligro en equipos antiguos es quedarse sin memoria libre y entrar
+     en swap (rendimiento hundido). El auto-cálculo reserva RAM para el SO, la
+     GUI y la caché de disco, y baja a secuencial si hay poca libre.
+
+0.5  Buen ciudadano del sistema ("sin sobrecargar"): bajar la prioridad del
+     proceso (modo ligero) y dejar un núcleo libre en equipos con pocos.
+
+0.6  Separación de responsabilidades (lo pide el enunciado):
+     - recursos.py   -> SÓLO mide la máquina y calcula hilos. Sin conocer ZIPs.
+     - paralelo.py   -> SÓLO orquesta trabajadores (pool + pausa/cancelación).
+     - motor_*.py    -> SÓLO la lógica de su tarea (qué comprimir/borrar).
+     Los motores dejan de "saber" de hilos; piden un ejecutor y punto.
+
+
+-------------------------------------------------------------------------------
+ RESUMEN DE FASES
+-------------------------------------------------------------------------------
+  Fase 0  Base medible: benchmark + pruebas de ida y vuelta (round-trip).
+  Fase 1  Módulo recursos.py: medir CPU y RAM (multiplataforma, sin depender
+          de nada externo; usa psutil solo si está).
+  Fase 2  Auto-cálculo de hilos por CPU + RAM + tope + modo ligero.
+  Fase 3  Módulo paralelo.py: pool de trabajadores reutilizable (separación).
+  Fase 4  Punto 6: compresión de carpetas hermanas en paralelo.
+  Fase 5  Punto 5: agrupar subárboles pequeños en un único ZIP.
+  Fase 6  Descompresión y borrado: rendimiento y paralelismo opcional.
+  Fase 7  Integración en la GUI (modo automático por defecto + avanzado).
+  Fase 8  Perfilado, ajuste fino y throttling adaptativo.
+
+  Orden recomendado de entrega: 0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 7 (ya se nota
+  la mejora aquí) -> 6 -> 8. Cada fase es independiente y se puede publicar
+  suelta; nada rompe la compatibilidad con archivos ya creados.
+
+
+===============================================================================
+ FASE 0 — LÍNEA BASE MEDIBLE
+===============================================================================
+Objetivo
+  No optimizar a ciegas. Poder decir "antes X segundos, ahora Y".
+
+Entregables
+  - bench.py: crea un árbol de prueba sintético (parámetros: nº carpetas,
+    ancho, profundidad, tamaños, mezcla de comprimibles / ya-comprimidos) y
+    cronometra comprimir -> descomprimir -> comparar.
+  - Prueba de ida y vuelta (round-trip): comprimir una carpeta, descomprimir el
+    ZIP y verificar que el árbol resultante es idéntico byte a byte
+    (nombres, contenido; fechas con tolerancia).
+  - 2 perfiles de referencia para comparar siempre:
+      P_antiguo : 2 núcleos, 4 GB RAM, HDD (o simulado limitando hilos=1).
+      P_moderno : 8 núcleos, 16 GB RAM, SSD.
+
+Criterios de aceptación
+  - El round-trip pasa al 100% con y sin las mejoras nuevas.
+  - bench.py imprime tiempo, MB/s y pico de memoria.
+
+Riesgos
+  - Sin medición, "más hilos" puede empeorar en HDD y nadie se entera.
+
+
+===============================================================================
+ FASE 1 — MÓDULO recursos.py (MEDIR LA MÁQUINA)
+===============================================================================
+Objetivo
+  Un módulo puro que hace un RETRATO TÉCNICO de la máquina donde corre el
+  programa y lo resume en un PerfilSistema. No solo CPU/RAM/disco: mide todo lo
+  que de verdad cambia una decisión de rendimiento (cuántos hilos, secuencial o
+  no, tamaño de buffers, ser buen ciudadano). Multiplataforma, primero con la
+  biblioteca estándar; psutil solo si está instalado (dependencia OPCIONAL, no
+  obligatoria). Regla de oro: cada sonda degrada a None/"desconocido" sin lanzar
+  excepción, y "sé poco" siempre se traduce en "voy conservador".
+
+Archivos
+  + recursos.py (nuevo)
+
+SEÑALES QUE SE MIDEN Y POR QUÉ (cada una cambia una decisión concreta)
+  CPU
+    - cpu (usables)      Núcleos disponibles para ESTE proceso (afinidad/cgroups).
+    - cpu_logicos        Hilos lógicos totales.
+    - cpu_fisicos        Núcleos físicos sin contar hyperthreads (SMT). La
+                         compresión es CPU-bound: 2 hilos en el mismo núcleo
+                         físico rinden mucho menos que en 2 núcleos reales, así
+                         que el tope de hilos se calibra mejor con los físicos.
+  Memoria
+    - ram_total/disp     Cuánta hay y cuánta libre (limita hilos por RAM).
+    - swap_total/usado   Si YA se está usando swap/pagefile, el equipo está corto
+                         de RAM -> secuencial sin dudarlo (señal más fuerte que la
+                         RAM libre a secas).
+  Disco
+    - disco_lento        HDD (rotacional) vs SSD: en HDD, menos hilos.
+    - disco_libre        Espacio libre en el destino (decide agrupar y avisar).
+    - mismo_volumen      ¿Origen y destino en el MISMO dispositivo? En HDD, leer y
+                         escribir a la vez en el mismo disco provoca saltos de
+                         cabezal (peor en paralelo). En discos distintos, ayuda.
+    - tipo_unidad        local / red / extraible: una unidad de red o un USB piden
+                         menos hilos y buffers distintos (y refuerzan el agrupado).
+  Sistema / energía
+    - carga              Carga a 1 min normalizada por núcleo: si el equipo ya
+                         viene ocupado, arrancar con menos hilos y ceder terreno
+                         (base del throttling de la Fase 8).
+    - energia            bateria vs enchufado: con batería, más suave (menos hilos,
+                         prioridad baja) para no fundirla ni calentar.
+    - proceso_64bit      Un proceso de 32 bits topa en ~2-4 GB de espacio de
+                         direcciones: limita la RAM útil por hilo.
+
+  Cómo alimentan la Fase 2 (calcular_hilos) y la Fase 8 (throttling):
+    swap_usado>0 o carga alta o energia=="bateria" o tipo_unidad=="red"  -> bajar
+    hilos (o secuencial); cpu_fisicos afina el tope por CPU; mismo_volumen+HDD
+    aplica el descuento por disco lento; proceso_64bit acota ram_por_hilo.
+
+Contenido de referencia (implementación completa, lista para pegar):
+
+    # recursos.py
+    # -*- coding: utf-8 -*-
+    """Medición de la máquina y cálculo de hilos. No sabe nada de ZIPs."""
+    from __future__ import annotations
+    import os
+    import shutil
+    import sys
+    from dataclasses import dataclass
+
+    MB = 1024 * 1024
+
+    # ---- CPU ----------------------------------------------------------------
+    def cpu_utilizables() -> int:
+        """Núcleos realmente disponibles para ESTE proceso.
+        En Linux respeta la afinidad y los límites de cgroups (contenedores)."""
+        try:
+            return max(1, len(os.sched_getaffinity(0)))   # Linux
+        except AttributeError:
+            return max(1, os.cpu_count() or 1)             # Windows / macOS
+
+    def cpu_logicos() -> int:
+        """Hilos lógicos totales de la máquina."""
+        return max(1, os.cpu_count() or 1)
+
+    def cpu_fisicos() -> int | None:
+        """Núcleos físicos (sin hyperthreads). None si no se puede saber.
+        Importa porque comprimir es CPU-bound: dos hilos en el mismo núcleo
+        físico rinden bastante menos que en dos núcleos distintos."""
+        try:
+            import psutil
+            n = psutil.cpu_count(logical=False)
+            if n:
+                return int(n)
+        except Exception:
+            pass
+        # Linux: pares (physical id, core id) únicos en /proc/cpuinfo.
+        try:
+            fisicos = set()
+            paquete = core = None
+            with open("/proc/cpuinfo", encoding="ascii", errors="ignore") as fh:
+                for linea in fh:
+                    if linea.startswith("physical id"):
+                        paquete = linea.split(":")[1].strip()
+                    elif linea.startswith("core id"):
+                        core = linea.split(":")[1].strip()
+                    elif not linea.strip():
+                        if paquete is not None and core is not None:
+                            fisicos.add((paquete, core))
+                        paquete = core = None
+            if fisicos:
+                return len(fisicos)
+        except OSError:
+            pass
+        return None
+
+    def carga_sistema(cpu: int) -> float | None:
+        """Carga a 1 min NORMALIZADA por núcleo: 0.0 ocioso, ~1.0 lleno,
+        >1 saturado. None si el SO no la expone. Permite arrancar con menos
+        hilos si el equipo ya viene ocupado y ceder terreno (Fase 8)."""
+        try:
+            la1, _, _ = os.getloadavg()                # Linux / macOS
+            return la1 / max(1, cpu)
+        except (AttributeError, OSError):
+            pass
+        try:
+            import psutil                              # Windows (muestreo corto)
+            return psutil.cpu_percent(interval=0.1) / 100.0
+        except Exception:
+            return None
+
+    # ---- RAM ----------------------------------------------------------------
+    def _ram_psutil() -> tuple[int, int] | None:
+        try:
+            import psutil
+        except Exception:
+            return None
+        vm = psutil.virtual_memory()
+        return vm.total, vm.available
+
+    def _ram_linux() -> tuple[int, int] | None:
+        try:
+            total = disp = 0
+            with open("/proc/meminfo", "r", encoding="ascii", errors="ignore") as fh:
+                for linea in fh:
+                    campo, _, resto = linea.partition(":")
+                    if campo == "MemTotal":
+                        total = int(resto.split()[0]) * 1024
+                    elif campo == "MemAvailable":
+                        disp = int(resto.split()[0]) * 1024
+                    if total and disp:
+                        break
+            return (total, disp) if total else None
+        except (OSError, ValueError):
+            return None
+
+    def _ram_windows() -> tuple[int, int] | None:
+        try:
+            import ctypes
+            class M(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            st = M(); st.dwLength = ctypes.sizeof(M)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return None
+            return st.ullTotalPhys, st.ullAvailPhys
+        except Exception:
+            return None
+
+    def _ram_posix_total() -> tuple[int, int] | None:
+        # Último recurso (p.ej. macOS sin psutil): solo total fiable;
+        # estimamos "disponible" de forma prudente como la mitad del total.
+        try:
+            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            return total, total // 2
+        except (AttributeError, ValueError, OSError):
+            return None
+
+    def ram_total_y_disponible() -> tuple[int, int, str]:
+        """(total, disponible, origen). Si nada funciona -> (0, 0, 'desconocido')."""
+        for nombre, fn in (("psutil", _ram_psutil),
+                           ("meminfo", _ram_linux),
+                           ("winapi", _ram_windows),
+                           ("estimado", _ram_posix_total)):
+            r = fn()
+            if r and r[0] > 0:
+                return r[0], r[1], nombre
+        return 0, 0, "desconocido"
+
+    # ---- Swap / paginación --------------------------------------------------
+    def swap_total_y_usado() -> tuple[int, int]:
+        """(total, usado) de swap/pagefile en bytes; (0, 0) si no se sabe.
+        Si `usado` > 0 el equipo ya está paginando: está corto de RAM y hay
+        que caer a secuencial pase lo que pase."""
+        try:
+            import psutil
+            s = psutil.swap_memory()
+            return int(s.total), int(s.used)
+        except Exception:
+            pass
+        try:  # Linux: /proc/meminfo
+            total = libre = None
+            with open("/proc/meminfo", encoding="ascii", errors="ignore") as fh:
+                for linea in fh:
+                    if linea.startswith("SwapTotal"):
+                        total = int(linea.split()[1]) * 1024
+                    elif linea.startswith("SwapFree"):
+                        libre = int(linea.split()[1]) * 1024
+            if total is not None and libre is not None:
+                return total, total - libre
+        except (OSError, ValueError):
+            pass
+        return 0, 0
+
+    # ---- Disco (best-effort) ------------------------------------------------
+    def es_disco_lento(ruta: str) -> bool | None:
+        """True=HDD, False=SSD, None=no se sabe. Solo Linux de forma fiable."""
+        try:
+            import shutil, subprocess  # noqa
+            # Linux: /sys/block/<dev>/queue/rotational (1 = HDD)
+            st = os.stat(ruta)
+            mayor = os.major(st.st_dev)
+            for base in os.listdir("/sys/block"):
+                p = f"/sys/block/{base}/dev"
+                if os.path.exists(p):
+                    with open(p) as fh:
+                        if fh.read().split(":")[0] == str(mayor):
+                            rot = f"/sys/block/{base}/queue/rotational"
+                            with open(rot) as r:
+                                return r.read().strip() == "1"
+        except Exception:
+            pass
+        return None   # Windows/macOS: no fiable sin dependencias; se ignora.
+
+    def espacio_libre(ruta: str) -> int:
+        """Bytes libres en el volumen de `ruta` (0 si no se puede consultar)."""
+        try:
+            return shutil.disk_usage(ruta).free
+        except OSError:
+            return 0
+
+    def mismo_volumen(a: str, b: str) -> bool | None:
+        """¿`a` y `b` en el mismo dispositivo? En HDD, leer del origen y escribir
+        el ZIP en el MISMO disco a la vez castiga (saltos de cabezal)."""
+        try:
+            return os.stat(a).st_dev == os.stat(b).st_dev
+        except OSError:
+            return None
+
+    def tipo_unidad(ruta: str) -> str:
+        """'local' | 'red' | 'extraible' | 'desconocido'. Una unidad de red o un
+        USB piden menos hilos y buffers distintos."""
+        try:
+            if os.name == "nt":
+                import ctypes
+                raiz = os.path.splitdrive(os.path.abspath(ruta))[0] + "\\"
+                t = ctypes.windll.kernel32.GetDriveTypeW(ctypes.c_wchar_p(raiz))
+                # 2=extraible 3=fijo 4=red 5=CD 6=RAMdisk
+                return {2: "extraible", 3: "local", 4: "red",
+                        5: "extraible", 6: "local"}.get(t, "desconocido")
+            # POSIX: el punto de montaje más específico que contiene la ruta.
+            objetivo = os.path.abspath(ruta)
+            mejor_punto = mejor_fs = ""
+            with open("/proc/mounts", encoding="utf-8", errors="ignore") as fh:
+                for linea in fh:
+                    partes = linea.split()
+                    if len(partes) < 3:
+                        continue
+                    punto, fstipo = partes[1], partes[2]
+                    if objetivo.startswith(punto) and len(punto) >= len(mejor_punto):
+                        mejor_punto, mejor_fs = punto, fstipo
+            if mejor_fs in ("nfs", "nfs4", "cifs", "smbfs", "smb3", "fuse.sshfs"):
+                return "red"
+            return "local" if mejor_fs else "desconocido"
+        except Exception:
+            return "desconocido"
+
+    # ---- Energía y arquitectura --------------------------------------------
+    def estado_energia() -> str:
+        """'enchufado' | 'bateria' | 'desconocido'. Con batería conviene ser más
+        suave (menos hilos, prioridad baja)."""
+        try:
+            import psutil
+            b = psutil.sensors_battery()
+            if b is None:
+                return "enchufado"          # sin batería -> sobremesa/enchufado
+            return "enchufado" if b.power_plugged else "bateria"
+        except Exception:
+            pass
+        try:
+            if os.name == "nt":
+                import ctypes
+                class SPS(ctypes.Structure):
+                    _fields_ = [("ACLineStatus", ctypes.c_ubyte),
+                                ("BatteryFlag", ctypes.c_ubyte),
+                                ("BatteryLifePercent", ctypes.c_ubyte),
+                                ("SystemStatusFlag", ctypes.c_ubyte),
+                                ("BatteryLifeTime", ctypes.c_ulong),
+                                ("BatteryFullLifeTime", ctypes.c_ulong)]
+                sps = SPS()
+                if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(sps)):
+                    if sps.ACLineStatus == 1:
+                        return "enchufado"
+                    if sps.ACLineStatus == 0:
+                        return "bateria"
+        except Exception:
+            pass
+        return "desconocido"
+
+    def proceso_64bit() -> bool:
+        """False si el intérprete es de 32 bits (espacio de direcciones ~2-4 GB)."""
+        return sys.maxsize > 2 ** 32
+
+    # ---- Modo ligero --------------------------------------------------------
+    def bajar_prioridad() -> None:
+        """Que el equipo siga usable mientras trabajamos."""
+        try:
+            if os.name == "posix":
+                os.nice(10)                                   # Linux/macOS
+            else:
+                import ctypes
+                BELOW_NORMAL = 0x00004000
+                h = ctypes.windll.kernel32.GetCurrentProcess()
+                ctypes.windll.kernel32.SetPriorityClass(h, BELOW_NORMAL)
+        except Exception:
+            pass
+
+    @dataclass(frozen=True)
+    class PerfilSistema:
+        cpu: int                     # núcleos usables por ESTE proceso
+        cpu_logicos: int
+        cpu_fisicos: int | None
+        ram_total: int
+        ram_disponible: int
+        origen_ram: str
+        swap_total: int
+        swap_usado: int
+        disco_lento: bool | None
+        disco_libre: int
+        mismo_volumen: bool | None   # origen vs destino (None si no aplica)
+        tipo_unidad: str             # local | red | extraible | desconocido
+        carga: float | None          # carga a 1 min por núcleo (None si no se sabe)
+        energia: str                 # enchufado | bateria | desconocido
+        proceso_64bit: bool
+
+    def perfil(ruta_trabajo: str = ".",
+               ruta_origen: str | None = None) -> PerfilSistema:
+        """Retrato técnico de la máquina. `ruta_trabajo` = donde se escribe (la
+        salida); `ruta_origen` = de dónde se lee, para saber si comparten disco."""
+        cpu = cpu_utilizables()
+        total, disp, origen = ram_total_y_disponible()
+        sw_total, sw_usado = swap_total_y_usado()
+        mismo = (mismo_volumen(ruta_origen, ruta_trabajo)
+                 if ruta_origen else None)
+        return PerfilSistema(
+            cpu=cpu,
+            cpu_logicos=cpu_logicos(),
+            cpu_fisicos=cpu_fisicos(),
+            ram_total=total,
+            ram_disponible=disp,
+            origen_ram=origen,
+            swap_total=sw_total,
+            swap_usado=sw_usado,
+            disco_lento=es_disco_lento(ruta_trabajo),
+            disco_libre=espacio_libre(ruta_trabajo),
+            mismo_volumen=mismo,
+            tipo_unidad=tipo_unidad(ruta_trabajo),
+            carga=carga_sistema(cpu),
+            energia=estado_energia(),
+            proceso_64bit=proceso_64bit(),
+        )
+
+    def resumen(p: "PerfilSistema") -> str:
+        """Una línea legible del perfil, para el log de arranque (transparencia)."""
+        def gb(n: int) -> str:
+            return f"{n / (1024 ** 3):.1f} GB"
+        disco = ("HDD" if p.disco_lento else
+                 "SSD" if p.disco_lento is False else "disco ?")
+        partes = [f"{p.cpu} núcleos usables"]
+        if p.cpu_fisicos:
+            partes.append(f"{p.cpu_fisicos} físicos")
+        partes.append(f"{gb(p.ram_disponible)} libres de {gb(p.ram_total)}")
+        if p.swap_usado:
+            partes.append(f"swap en uso {gb(p.swap_usado)}")
+        partes.append(f"{disco}/{p.tipo_unidad}")
+        if p.carga is not None:
+            partes.append(f"carga {p.carga:.2f}")
+        if p.energia == "bateria":
+            partes.append("batería")
+        return ", ".join(partes)
+
+Criterios de aceptación
+  - perfil() no lanza excepción en ningún SO (todo va envuelto); cada sonda cae a
+    None/"desconocido"/0 por su cuenta y el resto del perfil se rellena igual.
+  - Si no se puede medir la RAM, origen == "desconocido" y el sistema lo trata
+    como "sé poco -> voy conservador".
+  - resumen(perfil()) produce una línea legible en cualquier máquina.
+
+Riesgos
+  - Detección HDD/SSD: fiable en Linux (/sys/.../rotational) y en Windows
+    (DeviceIoControl StorageDeviceSeekPenaltyProperty, _es_disco_lento_windows).
+    macOS sin psutil sigue devolviendo None. Verificado en una máquina real: el
+    IOCTL acertó "HDD" en un HGST mecánico (coincide con Get-PhysicalDisk).
+  - cpu_fisicos: fiable con psutil, en Linux (/proc/cpuinfo) y en Windows
+    (GetLogicalProcessorInformationEx, _cpu_fisicos_windows). Verificado: 2
+    físicos / 4 lógicos en un i5-3360M. Sin ninguna vía -> None (conservador).
+  - carga y swap: plenos con psutil; sin él, fiables en Linux y None/0 en
+    Windows/macOS (el cálculo lo trata como conservador).
+  - tipo_unidad/energia son best-effort: ante la duda, "desconocido" -> el
+    cálculo de hilos no aplica su penalización (no arriesga de más, solo deja de
+    optimizar ese matiz).
+
+
+===============================================================================
+ FASE 2 — AUTO-CÁLCULO DE HILOS (CPU + RAM + TOPE + MODO LIGERO)
+===============================================================================
+Objetivo
+  Sustituir el calcular_hilos() (solo miraba CPU) por uno que combine núcleos
+  (físicos incluidos), RAM disponible, swap, tope, mínimo de RAM y las señales
+  nuevas de la Fase 1. Y que el PERFIL de la máquina se mida una vez y sea COMÚN
+  a los tres motores (comprimir, descomprimir, eliminar).
+
+Archivos
+  ~ recursos.py        (PoliticaHilos + calcular_hilos + preparar)
+  ~ motor_comprimir.py     (Opciones.politica; usa recursos.preparar/calcular_hilos)
+  ~ motor_descomprimir.py  (Opciones.politica; usa recursos.preparar)
+  ~ motor_eliminar.py      (Opciones.politica; usa recursos.preparar)
+  ~ bench.py               (fuerza hilos vía PoliticaHilos)
+
+DECISIÓN DE DISEÑO (común a los tres motores)
+  Los ajustes de rendimiento NO se duplican en cada Opciones: viven en una sola
+  dataclass compartida, recursos.PoliticaHilos, y cada motor la lleva como campo
+  `politica`. El perfil se mide en UN sitio, recursos.preparar(), que además
+  registra la máquina en el log y aplica el modo ligero. Así el criterio es
+  idéntico en los tres y se toca en un solo lugar.
+
+    @dataclass
+    class PoliticaHilos:                   # en recursos.py
+        hilos: int = 0                     # 0 = automático; >0 lo fuerza el usuario
+        hilos_max: int = 8                 # tope absoluto (evita paliza de E/S)
+        ram_por_hilo_mb: int = 192         # colchón de RAM por hilo
+        ram_reservada_mb: int = 0          # 0 = adaptativo: max(512, 20% RAM total)
+        ram_minima_paralelo_mb: int = 1024 # por debajo -> secuencial
+        prioridad_baja: bool = True        # modo ligero por defecto
+
+  Cada Opciones (los tres motores):
+        politica: recursos.PoliticaHilos = field(
+            default_factory=recursos.PoliticaHilos)
+
+  Punto de entrada COMÚN (recursos.py):
+    def preparar(ruta_trabajo=".", politica=None, *, ruta_origen=None, log=print):
+        # mide el perfil (una vez), lo registra ("Máquina: ...") y baja la
+        # prioridad si politica.prioridad_baja. Devuelve el PerfilSistema.
+    Cada motor llama a recursos.preparar(...) al arrancar; ya no vuelve a medir
+    la máquina por su cuenta. Comprimir, además, hace:
+        n = recursos.calcular_hilos(perf, opts.politica, unidades=len(pendientes))
+
+Implementación de referencia de calcular_hilos (en recursos.py):
+
+    def calcular_hilos(p: PerfilSistema, pol: PoliticaHilos,
+                       unidades: int = 0) -> int:
+        if pol.hilos > 0:                  # el usuario lo forzó: se respeta
+            base = pol.hilos
+        else:
+            cpu = p.cpu
+            # 1) Límite por CPU, dejando un núcleo libre si hay pocos, y sin
+            #    pasar de los núcleos FÍSICOS (SMT no dobla el trabajo CPU-bound).
+            por_cpu = 1 if cpu <= 2 else cpu - 1
+            if p.cpu_fisicos:
+                por_cpu = min(por_cpu, p.cpu_fisicos)
+            por_cpu = min(por_cpu, pol.hilos_max or por_cpu)
+
+            # 2) Límite por RAM disponible (con colchón). 32 bits -> tope 2.
+            if p.ram_disponible > 0:
+                reserva = (pol.ram_reservada_mb * MB
+                           or max(512 * MB, int(p.ram_total * 0.20)))
+                util = max(0, p.ram_disponible - reserva)
+                por_ram = max(1, util // (max(1, pol.ram_por_hilo_mb) * MB))
+            else:
+                por_ram = 2                 # RAM desconocida -> prudencia
+            if not p.proceso_64bit:
+                por_ram = min(por_ram, 2)
+
+            base = max(1, min(por_cpu, por_ram))
+
+            # 3) Poca RAM libre o swap en uso -> secuencial, pase lo que pase.
+            if 0 < p.ram_disponible < pol.ram_minima_paralelo_mb * MB:
+                base = 1
+            if p.swap_usado > 0:
+                base = 1
+
+            # 4) Penalizaciones por E/S y estado (a la mitad, mínimo 1).
+            if p.disco_lento is True and base > 1:      # HDD: saltos de cabezal
+                base = max(1, base // 2)
+            if p.tipo_unidad in ("red", "extraible") and base > 1:
+                base = max(1, base // 2)
+            if p.carga is not None and p.carga >= 1.0 and base > 1:
+                base = max(1, base // 2)                 # equipo ya ocupado
+            if p.energia == "bateria" and base > 2:
+                base = 2                                 # con batería, suave
+
+        # 5) Nunca más hilos que tareas disponibles.
+        if unidades > 0:
+            base = min(base, unidades)
+        return max(1, int(base))
+
+Ejemplos del resultado (VALIDADOS en pruebas):
+    2 núcleos / 900 MB libres  -> 1  (secuencial; equipo antiguo protegido)
+    4 núcleos / 3.2 GB libres  -> 3
+    8 núcleos / 12 GB libres   -> 7  (limitado por CPU-1, no por RAM)
+    8 núcleos / 12 GB / HDD    -> 3  (mitad por disco lento)
+    Cualquiera con 2 carpetas  -> 2  (tope por nº de tareas)
+    swap en uso / poca RAM     -> 1  (secuencial)
+    unidad de red o USB        -> mitad de hilos
+    carga >= 1.0 por núcleo    -> mitad de hilos
+    con batería                -> tope 2 hilos
+    8 lógicos / 4 físicos      -> 4  (tope por núcleos físicos)
+    proceso de 32 bits         -> tope 2 por RAM
+
+Comportamiento clave
+  - hilos == 1 -> CAMINO SECUENCIAL de siempre (sin pool, sin colas), para no
+    meter overhead en los equipos que menos pueden con él.
+  - Se registra el perfil en el log ("Máquina: 4 núcleos usables, 3.2 GB libres,
+    SSD/local") en los TRES motores, para transparencia.
+  - En Fase 2 los bucles siguen SECUENCIALES: calcular_hilos ya decide y se
+    registra, pero el pool que consume `n` llega en la Fase 4 (comprimir) y la
+    Fase 6 (descomprimir). Eliminar se queda secuencial a propósito.
+
+Criterios de aceptación
+  - calcular_hilos reproduce la tabla de ejemplos (validado con pruebas unitarias).
+  - Los tres motores registran el mismo perfil de máquina y respetan el modo
+    ligero; el round-trip de bench.py sigue pasando al 100 %.
+  - En P_antiguo el auto da 1 (o 2 como mucho); en P_moderno da >1 (el ahorro de
+    tiempo se mide en la Fase 4, cuando el pool entra en acción).
+
+
+===============================================================================
+ FASE 3 — MÓDULO paralelo.py (SEPARAR LA LÓGICA DE HILOS)
+===============================================================================
+Objetivo
+  Sacar TODA la orquestación de hilos fuera de los motores. Un pool genérico
+  que recibe un "planificador" (quién está listo) y una "función de trabajo"
+  (qué hacer con cada unidad), y se encarga de: repartir, esperar a que se
+  liberen dependencias, pausar, cancelar y propagar el primer error.
+
+Archivos
+  + paralelo.py (nuevo)
+
+Por qué aquí y no en el Planificador
+  El Planificador de motor_comprimir.py es LÓGICA DE DOMINIO (dependencias
+  padre/hijo del árbol). La COORDINACIÓN entre hilos (esperar, despertar,
+  parar) es genérica y va en paralelo.py. Así el motor no vuelve a tocar
+  threading directamente. El Planificador se queda tal cual (ya tiene cerrojo
+  interno y métodos siguiente()/terminada()/restantes).
+
+Esqueleto de referencia:
+
+    # paralelo.py
+    from __future__ import annotations
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from typing import Callable, Protocol
+
+    class Plan(Protocol):
+        restantes: int
+        def siguiente(self): ...          # -> item | None (no bloqueante)
+        def terminada(self, item) -> None: ...
+
+    class Ejecutor:
+        """Reparte las unidades listas del plan entre `hilos` trabajadores.
+        `trabajo(item)` corre en un worker y NO debe tocar la GUI directamente
+        (usa el callback log/progreso que ya son seguros entre hilos)."""
+
+        def __init__(self, hilos: int) -> None:
+            self.hilos = max(1, hilos)
+            self._cond = threading.Condition()
+            self._en_vuelo = 0
+            self._parar = False
+            self._error: BaseException | None = None
+
+        def pedir_parada(self) -> None:
+            with self._cond:
+                self._parar = True
+                self._cond.notify_all()
+
+        def ejecutar(self, plan: "Plan",
+                     trabajo: Callable[[object], None],
+                     pausar: Callable[[], bool]) -> str:
+            """Devuelve 'ok' | 'pausado' | 'error'."""
+            def worker() -> None:
+                while True:
+                    with self._cond:
+                        while True:
+                            if self._parar or self._error or pausar():
+                                return
+                            item = plan.siguiente()
+                            if item is not None:
+                                self._en_vuelo += 1
+                                break
+                            if plan.restantes == 0 and self._en_vuelo == 0:
+                                self._cond.notify_all()
+                                return
+                            self._cond.wait(timeout=0.2)   # se re-evalúa pausar()
+                    try:
+                        trabajo(item)                      # zlib libera el GIL
+                    except BaseException as e:             # noqa: BLE001
+                        with self._cond:
+                            if self._error is None:
+                                self._error = e
+                            self._cond.notify_all()
+                        return
+                    finally:
+                        with self._cond:
+                            plan.terminada(item)   # puede liberar nuevos listos
+                            self._en_vuelo -= 1
+                            self._cond.notify_all()
+
+            with ThreadPoolExecutor(max_workers=self.hilos) as ex:
+                futuros = [ex.submit(worker) for _ in range(self.hilos)]
+                for f in futuros:
+                    f.result()
+
+            if self._error is not None:
+                raise self._error
+            return "pausado" if (self._parar or pausar()) else "ok"
+
+Notas
+  - El `while` interno vuelve a comprobar pausar()/parar en cada vuelta con un
+    timeout corto: así una pausa se atiende sin esperar a que se libere trabajo.
+  - No se sostiene el cerrojo durante `trabajo(item)` (la parte pesada), que es
+    justo donde queremos concurrencia real.
+  - Sirve igual para descompresión (Fase 6) sin duplicar código.
+
+Criterios de aceptación
+  - Test de estrés: 10.000 unidades con dependencias aleatorias, N hilos, con
+    pausas y cancelaciones -> nunca cuelga, nunca procesa dos veces la misma.
+
+ESTADO: IMPLEMENTADO y VALIDADO. paralelo.py contiene Plan (Protocol) y Ejecutor
+  (pool + pedir_parada + pausar + propagación del primer error). El test de
+  estrés pasa: completar entero, pausar y reanudar con otro Ejecutor, cancelar
+  desde otro hilo, propagar un error y hilos=1; todo sin colgar (con guardia de
+  timeout) ni procesar nada dos veces, repetido 5 veces sin fallos. Los motores
+  todavía NO lo usan: la sustitución del bucle secuencial es la Fase 4.
+
+
+===============================================================================
+ FASE 4 — PUNTO 6: COMPRESIÓN DE CARPETAS HERMANAS EN PARALELO
+===============================================================================
+Objetivo
+  Sustituir el bucle secuencial de motor_comprimir.procesar() por el Ejecutor
+  de la Fase 3, alimentado por el Planificador que ya existe.
+
+Archivos
+  ~ motor_comprimir.py (procesar)
+
+Qué se hace
+  1) Calcular hilos:
+        from recursos import perfil, calcular_hilos, bajar_prioridad
+        perf = perfil(str(salida))
+        n = calcular_hilos(perf, opts, unidades=len(pendientes))
+        log(f"Detectado: {perf.cpu} núcleos, "
+            f"{humano(perf.ram_disponible)} libres -> {n} hilos")
+        if opts.prioridad_baja:
+            bajar_prioridad()
+  2) Si n == 1: se conserva EXACTAMENTE el bucle secuencial actual (rápido de
+     escribir, cero riesgo en equipos antiguos).
+  3) Si n > 1: se define la función de trabajo por carpeta y se lanza el pool:
+
+        estado_lock = threading.Lock()   # solo para procesadas/bytes/progreso
+        def trabajo(rel):
+            info = infos[rel]
+            destino, tam, entradas = comp.crear(rel, info)   # zlib, sin GIL
+            estado.marcar(rel, destino, tam, entradas)       # ya es thread-safe
+            if opts.limpiar:
+                comp.limpiar_hijos(rel, info)
+            with estado_lock:
+                nonlocal procesadas, bytes_hechos
+                procesadas += 1
+                bytes_hechos += info.bytes
+                if progreso:
+                    progreso(procesadas, total_pend,
+                             bytes_hechos / bytes_pend, rel.as_posix())
+
+        ejec = Ejecutor(n)
+        estado_final = ejec.ejecutar(plan, trabajo, pausar)
+
+Qué YA es seguro (no hay que tocar)
+  - estado.marcar() / anotar_errores(): tienen cerrojo interno.
+  - comp.errores.append(): append de lista es atómico en CPython.
+  - Los callbacks log y progreso de la GUI escriben en una queue.Queue
+    (thread-safe). Varios workers pueden llamarlos a la vez sin problema.
+
+Qué cambia de matiz con paralelismo
+  - Pausa / archivo PAUSA / Ctrl+C: se traduce a ejec.pedir_parada(); los
+    workers terminan su carpeta en curso y salen. El resto queda pendiente y
+    se reanuda por el Estado (ya lo hacía).
+  - max_dirs: el contador `procesadas` (bajo cerrojo) dispara pedir_parada().
+  - preguntar_cada (confirmar cada N): mal encaje con paralelo; pasa a ser
+    "mejor esfuerzo" (se comprueba entre lotes) o se desactiva cuando n>1.
+  - El registro detallado sigue funcionando pero las líneas de distintas
+    carpetas pueden intercalarse; es aceptable (y en modo resumido ni se nota).
+
+Criterios de aceptación
+  - Round-trip idéntico con n=1 y con n>1.
+  - En P_moderno, árbol ancho: speedup cercano a (núcleos usados) para carpetas
+    con archivos comprimibles; menor si son .jpg/.mp4 (ahí manda la E/S).
+  - Pausar y reanudar a mitad no pierde ni duplica carpetas.
+
+Riesgos y mitigación
+  - Árbol profundo estrecho: poco o ningún speedup (esperado, ver 0.2).
+  - HDD: ya viene mitigado por calcular_hilos (mitad de hilos).
+
+ESTADO: IMPLEMENTADO y VALIDADO. procesar() bifurca: con n<=1, el bucle
+  secuencial de siempre (idéntico); con n>1, paralelo.Ejecutor alimentado por el
+  Planificador. La función trabajo(rel) hace crear + estado.marcar + limpiar +
+  progreso; el Ejecutor llama a plan.terminada(). Pausa/PAUSA/max_dirs se
+  atienden con un predicado debe_pausar() pasado al Ejecutor (los workers
+  terminan su carpeta y salen; max_dirs sobrepasa como mucho n-1 carpetas).
+  'preguntar_cada' se ignora en paralelo (mal encaje). Validado: round-trip
+  idéntico con n=1 y n=4 en los 5 escenarios; speedup real en árbol ancho/mixto
+  (~2.4x y ~3.6x en un equipo de 4 núcleos); pausar por max_dirs y reanudar en
+  4 ciclos no pierde ni duplica carpetas. En equipos con poca RAM libre el auto
+  cae a secuencial (protección), demostrado en la máquina de pruebas.
+
+
+===============================================================================
+ FASE 5 — PUNTO 5: AGRUPAR SUBÁRBOLES PEQUEÑOS EN UN ÚNICO ZIP
+===============================================================================
+Objetivo
+  Empaquetar un subárbol entero (carpeta + todo lo que cuelga) en UN SOLO ZIP,
+  en vez de un .zip por subcarpeta. Beneficio doble:
+   (a) menos ZIPs diminutos -> menos abrir/cerrar archivos, menos creación de
+       carpetas y menos líneas de estado: en discos lentos y equipos antiguos
+       el "coste por archivo" es lo que más duele.
+   (b) menos unidades de trabajo -> el planificador reparte mejor.
+
+Archivos
+  ~ motor_comprimir.py (implementar Comprimidor.crear_agrupado; ya hay hueco)
+  El descompresor NO necesita cambios (ya crea carpetas intermedias a partir
+  de las rutas de las entradas y ya tolera entradas de directorio y la marca
+  "agrupado").
+
+Lo que ya está resuelto en el código
+  - seleccionar_agrupados(infos, orden, opts) YA decide qué carpetas se agrupan
+    según Opciones.agrupar_mb / agrupar_archivos / profundidad_max.
+  - procesar() YA excluye del plan las carpetas interiores a un agrupado:
+        orden = [r for r in orden if not any(p in agrupados for p in r.parents)]
+  - Comprimidor.crear() YA deriva a crear_agrupado() cuando rel está agrupado.
+  Falta SOLO el empaquetado.
+
+Implementación de referencia de crear_agrupado():
+
+    def crear_agrupado(self, rel: Path, info: "InfoDir"):
+        destino = self.destino(rel)
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        parcial = destino.with_name(destino.name + ".part")
+        parcial.unlink(missing_ok=True)
+        origen = ruta_abs(self.raiz, rel)
+        nombre_carpeta = self.raiz.name if rel == RAIZ else rel.name
+        entradas = 0
+        try:
+            with zipfile.ZipFile(parcial, "w", allowZip64=True,
+                                 strict_timestamps=False) as zf:
+                for dirpath, dirnames, filenames in os.walk(
+                        origen, followlinks=self.opts.seguir_enlaces):
+                    # Respetar las mismas opciones que la exploración normal.
+                    if not self.opts.seguir_enlaces:
+                        dirnames[:] = [d for d in dirnames
+                                       if not os.path.islink(os.path.join(dirpath, d))]
+                    if self.opts.omitir_ocultos:
+                        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                        filenames = [f for f in filenames if not f.startswith(".")]
+                    dirnames.sort()
+                    filenames.sort()
+                    rel_dir = Path(dirpath).relative_to(origen)
+
+                    # Carpeta vacía -> entrada de directorio para preservarla.
+                    if not filenames and not dirnames and rel_dir != RAIZ:
+                        zf.writestr(rel_dir.as_posix() + "/", b"")
+                        entradas += 1
+
+                    for nombre in filenames:
+                        ruta = os.path.join(dirpath, nombre)
+                        arc = (rel_dir / nombre).as_posix()
+                        comp = (zipfile.ZIP_STORED
+                                if os.path.splitext(nombre)[1].lower() in PRECOMPRIMIDAS
+                                else zipfile.ZIP_DEFLATED)
+                        try:
+                            zf.write(ruta, arc, compress_type=comp,
+                                     compresslevel=self.opts.nivel)
+                        except (OSError, ValueError) as e:
+                            msg = f"{(rel / rel_dir / nombre).as_posix()}: {e}"
+                            self.errores.append(msg)
+                            self.log(f"[!] No se pudo añadir {msg}")
+                            if self.opts.estricto:
+                                raise
+                            continue
+                        entradas += 1
+
+                zf.comment = self.marca(nombre_carpeta, 0, {}, agrupado=True)
+        except BaseException:
+            parcial.unlink(missing_ok=True)
+            raise
+        os.replace(parcial, destino)
+        return destino, destino.stat().st_size, entradas
+
+Compatibilidad con el resto
+  - El ZIP agrupado se guarda en la misma ruta que un ZIP normal de esa carpeta
+    (self.destino(rel)); su padre lo embebe como sub-zip con ZIP_STORED sin
+    enterarse de que dentro va un subárbol entero. Todo encaja sin tocar crear().
+  - Al descomprimir: el ZIP agrupado lleva la marca -> es_contenedor() = True,
+    se extrae y sus entradas con rutas anidadas ("sub/otra/archivo.txt")
+    reconstruyen todo el subárbol de una vez. No hay .zip internos que expandir.
+
+Auto-activación (importante para "automático")
+  - Agrupar CAMBIA la estructura del resultado: ya no puedes re-extraer una
+    sub-subcarpeta suelta sin expandir todo el grupo. Por eso NO se activa a
+    escondidas: se ofrece como "modo compacto/rápido" en la GUI.
+  - Preset recomendado cuando el usuario elige modo compacto:
+        agrupar_mb = 8,  agrupar_archivos = 300,  profundidad_max = 0
+    (ajustable en Fase 8 según lo que diga bench.py por perfil de máquina).
+  - Regla práctica: agrupar es más rentable cuanto más lento sea el disco y más
+    "polvo" de carpetas diminutas haya.
+
+Interacción con Fase 4
+  - Un subárbol agrupado es UNA unidad de trabajo (puede ser grande y quedar de
+    "rezagada" al final). Compensa de sobra por la caída del coste por archivo.
+
+Criterios de aceptación
+  - Round-trip idéntico con y sin agrupado.
+  - Carpetas vacías dentro del grupo se recuperan.
+  - En árbol con miles de carpetas minúsculas, modo compacto reduce nº de ZIPs
+    y tiempo total (medir con bench.py, sobre todo en HDD).
+
+ESTADO: IMPLEMENTADO y VALIDADO. Comprimidor.crear_agrupado() empaqueta el
+  subárbol con os.walk (mismas reglas que explorar: enlaces y ocultos),
+  preserva carpetas vacías con entradas de directorio, marca agrupado=True y
+  escribe .part -> os.replace. Se añadió el preset (COMPACTO_* +
+  aplicar_modo_compacto) y la bandera CLI --compacto (y bench.py --compacto).
+  Validado: round-trip idéntico con y sin agrupar, en secuencial y en paralelo;
+  carpeta vacía anidada dentro de un grupo recuperada; el agrupado colapsa 303
+  ZIPs a 15 en el escenario 'polvo' y baja el tiempo ~6x comprimir / ~5x
+  descomprimir (SSD; en HDD sería mayor). Funciona incluso cuando la raíz entera
+  es la unidad agrupada. Falta solo el toggle en la GUI (Fase 7).
+
+
+===============================================================================
+ FASE 6 — DESCOMPRIMIR Y ELIMINAR: RENDIMIENTO Y PARALELISMO OPCIONAL
+===============================================================================
+DESCOMPRIMIR (motor_descomprimir.py)
+  - Rápido de ganar ya: el buffer de copia es 1 MB (bien). Se puede subir a
+    2–4 MB en máquinas con RAM holgada (dato del perfil) y bajar a 256 KB si la
+    RAM libre es escasa. Auto según recursos.py.
+  - Paralelismo (opcional): tras extraer un ZIP aparecen sus .zip hijos, que son
+    independientes entre sí. Encaja con el mismo Ejecutor de la Fase 3: cada
+    worker extrae un contenedor y "encola" los contenedores hijos que hayan
+    aparecido. inflate y la E/S liberan el GIL, así que hay ganancia real.
+    - Mismo calcular_hilos() (CPU + RAM), misma cautela con HDD.
+    - _destino_seguro() y la escritura por temporal + os.replace ya lo hacen
+      seguro para reanudar; hay que revisar que borrar el .zip de origen se
+      haga solo tras cerrar el temporal (ya es así).
+
+ELIMINAR (motor_eliminar.py)
+  - Recomendación: SEGUIR SECUENCIAL por defecto. Borrar es metadatos
+    (unlink/rmdir): paralelizar apenas ayuda y en HDD empeora por los saltos.
+    Además rmdir exige que los hijos ya no estén (dependencia estricta).
+  - Único paralelismo con sentido (y solo si perfil.disco_lento is False):
+    borrar EN PARALELO los archivos DENTRO de una misma carpeta, y luego el
+    rmdir en serie. Ganancia modesta; baja prioridad.
+  - Lo que SÍ conviene ya: os.scandir en vez de recalcular, y contar() como
+    paso opcional (en árboles enormes, contar antes de borrar duplica el
+    recorrido; permitir "borrar sin contar" para ir más ligero).
+
+Criterios de aceptación
+  - Descompresión paralela: round-trip idéntico; pausa/reanuda sin duplicar.
+  - Eliminar: sin regresiones; el modo "sin contar" reduce el tiempo total.
+
+ESTADO: IMPLEMENTADO y VALIDADO.
+  DESCOMPRIMIR: buffer de copia adaptativo por RAM (_buffer_copia: 256 KB..4 MB)
+  y paralelismo opcional con el mismo Ejecutor. Como las unidades aparecen sobre
+  la marcha (al extraer un contenedor surgen sus .zip hijos), se usa _PlanDescomp
+  (cola dinámica; restantes = añadidas y no terminadas). _expandir_uno() extrae
+  un contenedor y devuelve los hijos; el worker los agrega al plan. n<=1 conserva
+  el bucle secuencial. Validado: round-trip idéntico secuencial y paralelo,
+  pausa por max_zips + reanudar (6 ciclos) sin perder ni duplicar; ~1.7x en árbol
+  ancho (menos que comprimir porque escribir es más de E/S).
+  ELIMINAR: se mantiene SECUENCIAL (lo recomendado). Añadido Opciones.contar
+  (por defecto True); con contar=False se salta el conteo previo (más ligero en
+  árboles enormes), se reportan los borrados reales y la barra es aproximada.
+  Banderas: --sin-contar (CLI) y casilla en la GUI. El paralelismo de borrado
+  (solo archivos dentro de una carpeta, solo SSD) se deja fuera por ganancia
+  modesta, como dice el propio plan.
+  GUI: Descomprimir ahora muestra el selector de hilos (usa_hilos=True).
+  OPTIMIZACIONES (análisis posterior): #6 leer_marca se cachea por (ruta, tamaño,
+  mtime) con functools.lru_cache -> la descompresión no reabre cada ZIP varias
+  veces solo para leer su marca. #7 _destino_seguro ya no hace resolve() por
+  entrada (realpath/syscall por archivo): resuelve la base una vez y comprueba
+  contención con normpath+prefijo; además aplica la protección anti-zip-slip
+  también a las entradas de directorio y rechaza ':' en Windows (letra de unidad
+  / flujos ADS). Validado: round-trip intacto y batería de casos zip-slip.
+  #8 Estado JSONL: buffer por bloques y flush AGRUPADO cada PASO_REGISTRO (50)
+  en vez de por carpeta bajo cerrojo; cerrar()/_volcar() vacían en las paradas
+  ordenadas, así que solo un corte abrupto obligaría a rehacer <=50 carpetas al
+  reanudar (idempotente). Validado: pausa/reanuda y round-trip intactos.
+
+
+===============================================================================
+ FASE 7 — INTEGRACIÓN EN LA GUI (zip_anidado.py)
+===============================================================================
+Objetivo
+  Que el usuario no tenga que saber nada: por defecto, automático.
+
+Cambios
+  - Por defecto opts.hilos = 0 (auto) y prioridad_baja = True en las tres
+    pestañas.
+  - En el log de arranque de cada tarea, imprimir el perfil detectado y los
+    hilos elegidos (transparencia).
+  - Opciones AVANZADAS (plegables, para quien quiera tocar):
+      * "Hilos: [Auto ▼] 1 2 3 4 ..."   (Auto = 0)
+      * [x] Modo ligero (prioridad baja)  -> ya activo por defecto
+      * [x] Modo compacto (agrupar carpetas pequeñas)  -> Punto 5, con su preset
+  - Recordar: los callbacks log/progreso ya vuelcan a queue.Queue, así que el
+    paralelismo de los motores NO requiere cambios en la fontanería de la GUI.
+    La GUI sigue lanzando UN hilo "trabajo"; ese hilo, dentro, abre el pool.
+
+Criterios de aceptación
+  - Sin tocar nada, en cualquier equipo la tarea corre y el equipo sigue usable.
+  - El texto "Detectado: N núcleos, X libres -> H hilos" aparece en el registro.
+
+ESTADO: IMPLEMENTADO y VALIDADO (kakoli.py, no zip_anidado.py). Por defecto las
+  tres pestañas usan PoliticaHilos(hilos=0 auto, prioridad_baja=True), así que
+  ya corren en automático y ligero sin tocar nada. El perfil se registra en el
+  log de cada tarea vía recursos.preparar ("Máquina: ...") y comprimir añade
+  "Compresión en paralelo con N hilos" / "secuencial (1 hilo)". Se añadió un
+  panel PLEGABLE "Opciones avanzadas (rendimiento)" común: en Comprimir con
+  selector de Hilos (Auto + 1..núcleos), Modo ligero y Modo compacto; en
+  Descomprimir/Eliminar solo Modo ligero (los hilos de descomprimir llegan en la
+  Fase 6, eliminar es secuencial). politica_desde() traduce los controles a la
+  PoliticaHilos. Validado headless (ventana oculta): construcción de las tres
+  pestañas, plegar/desplegar, y que las tres Opciones aceptan la política.
+
+
+===============================================================================
+ FASE 8 — PERFILADO, AJUSTE FINO Y THROTTLING ADAPTATIVO
+===============================================================================
+Objetivo
+  Afinar constantes con datos reales y añadir un freno automático bajo carga.
+
+Trabajo
+  - Ejecutar bench.py en P_antiguo y P_moderno; ajustar:
+      hilos_max, ram_por_hilo_mb, ram_reservada_mb, umbral de modo compacto.
+  - Throttling adaptativo (opcional, sobre todo Linux):
+      usar os.getloadavg() y, si la carga a 1 min supera núcleos*1.5, que el
+      Ejecutor mantenga algún worker "dormido" temporalmente. Mantiene la
+      promesa de "sin sobrecargar el sistema" cuando el usuario hace otras cosas.
+  - Revisar picos de memoria reales por hilo y recalibrar ram_por_hilo_mb
+    (probablemente se pueda bajar de 192; es un colchón deliberadamente amplio).
+
+Criterios de aceptación
+  - Los valores por defecto dan buen resultado en AMBOS perfiles sin tocar nada.
+  - Con carga externa alta, el uso de CPU del programa cede terreno.
+
+ESTADO: PARCIALMENTE IMPLEMENTADO (alcance limitado por tener una sola máquina).
+  HECHO:
+  - Throttling adaptativo: Ejecutor.ejecutar(limite_activos=..., intervalo) con un
+    hilo _Regulador que ajusta cuántos workers están activos. AHORA se regula por
+    CARGA EXTERNA (fracción 0..1 de CPU de OTROS procesos, sin contar el nuestro),
+    que es la señal correcta ("¿se ocupa el equipo con otras cosas?") y funciona
+    en 0..1 en ambos SO (antes los umbrales de loadavg 1.5/3.0 eran inalcanzables
+    con un %CPU). recursos.medidor_carga_externa() (GetSystemTimes+GetProcessTimes
+    en Windows; /proc/stat vs /proc/self/stat en Linux), objetivo_activos(externo)
+    con umbrales 0.25 (pleno) y 0.75 (un worker). Validado con carga externa REAL
+    (4 procesos saturando la CPU): en reposo usa los 4 workers, bajo carga baja a
+    1. El mecanismo del Ejecutor (techo fijo/dinámico) también validado.
+    PoliticaHilos.throttling = True por defecto.
+  - #3 (análisis): carga medible en Windows sin psutil (carga_sistema vía
+    GetSystemTimes), lo que activa el throttling en el SO objetivo (antes None).
+  - #1/#2 (análisis): detección de HDD/SSD (DeviceIoControl seek-penalty) y de
+    núcleos físicos (GetLogicalProcessorInformationEx) en Windows; antes eran
+    None y las penalizaciones no se aplicaban en el SO objetivo.
+  - #4 (análisis): calcular_hilos ya USA mismo_volumen. En HDD, si origen y
+    destino comparten disco mecánico se aplica una penalización EXTRA (doble
+    mitad) frente a discos distintos (una mitad). No afecta a SSD ni a la tabla
+    de ejemplos (que usa mismo_volumen=None).
+  - #5 (análisis): el castigo de arranque de calcular_hilos ya usa la CARGA
+    EXTERNA (misma señal y umbral 0.25 que el throttling), no la carga total con
+    umbral 1.0 (que significaba cosas distintas por SO). El perfil añade el campo
+    carga_externa, medido de una vez junto a la carga total (muestra_carga, un
+    solo intervalo). El diagnóstico muestra carga total y externa por separado.
+  - Recalibrado de ram_por_hilo_mb: medido el pico real (~0.5 MB por hilo con
+    bench.pico_memoria_bytes en procesos separados a 1/2/4 hilos). Bajado 192->128
+    (aún ~250x el coste real). No cambia ningún ejemplo de la tabla (todos están
+    limitados por CPU o por el suelo de 1 GB).
+  PENDIENTE (necesita hardware que aquí no hay del todo):
+  - Afinar hilos_max, ram_reservada_mb y el umbral del modo compacto. NOVEDAD:
+    la máquina de pruebas resultó ser un i5-3360M (2 núcleos/4 hilos) con HDD
+    mecánico real (~P_antiguo), ahora bien detectado. Se puede afinar el
+    descuento por HDD aquí, PERO con cuidado de caché: bench.py genera el árbol
+    en caliente (queda en la caché del SO), así que subestima el castigo del HDD
+    en lecturas en frío. Falta un P_moderno (8 núcleos/16 GB/SSD) para el otro
+    extremo.
+  - Validar el throttling REAL (no simulado) en Linux (os.getloadavg) o con
+    psutil / GetSystemTimes en Windows.
+  - MEJORAS DE PERFIL YA HECHAS (fuera de fase, tras análisis): detección de
+    núcleos físicos y de HDD/SSD en Windows (antes None). Pendientes del análisis:
+    medir carga en Windows con GetSystemTimes (activaría el throttling en el SO
+    objetivo); usar mismo_volumen para endurecer el descuento de HDD.
+
+
+===============================================================================
+ TABLA DE PARÁMETROS POR DEFECTO (y por qué)
+===============================================================================
+  hilos                = 0      Auto. Que decida la máquina.
+  hilos_max            = 8      Tope de E/S; más hilos rara vez compensan y en
+                                HDD estorban.
+  ram_por_hilo_mb      = 128    Colchón por hilo. Medido real en Fase 8: ~0.5 MB
+                                por hilo (zlib ~256 KB + buffers). 128 sigue
+                                siendo ~250x el coste real: limita hilos en
+                                equipos con poca RAM sin ser absurdo. Bajado
+                                desde 192 con esa medición. El protector real del
+                                SO/caché es ram_reservada_mb, no este colchón.
+  ram_reservada_mb     = 0      0 = adaptativo: max(512 MB, 20% RAM total). Deja
+                                aire al SO, la GUI y la caché.
+  ram_minima_paralelo  = 1024   Por debajo de 1 GB libre -> secuencial siempre.
+  prioridad_baja       = True   Modo ligero por defecto: el equipo sigue usable.
+  throttling           = True   Fase 8: cede CPU si la carga externa sube.
+
+  Estos números son PUNTOS DE PARTIDA; el resto (hilos_max, umbral compacto) sigue
+  pendiente de afinar con bench.py en HDD y en un equipo moderno (ver Fase 8).
+
+
+===============================================================================
+ MAPA DE ARCHIVOS (antes / después)
+===============================================================================
+  ANTES
+    motor_comprimir.py      (motor + utilidades + Planificador + calcular_hilos)
+    motor_descomprimir.py   (motor)
+    motor_eliminar.py       (motor)
+    zip_anidado.py          (GUI)
+
+  DESPUÉS
+    recursos.py    (NUEVO)  retrato técnico de la máquina (CPU lógicos/físicos,
+                            RAM, swap, disco HDD/SSD, espacio, mismo volumen,
+                            tipo de unidad, carga, energía, 32/64-bit),
+                            calcular_hilos y bajar_prioridad
+    paralelo.py    (NUEVO)  Ejecutor genérico (pool + pausa/cancelación)
+    motor_comprimir.py      motor de compresión + crear_agrupado implementado;
+                            calcular_hilos se IMPORTA de recursos (se elimina el
+                            de aquí). El Planificador se queda (es dominio).
+    motor_descomprimir.py   (opcional) descompresión paralela usando paralelo.py
+    motor_eliminar.py       secuencial (opción "sin contar"); paralelo solo SSD
+    zip_anidado.py          GUI: auto por defecto + opciones avanzadas
+    bench.py       (NUEVO)  banco de pruebas y round-trip
+
+  Los motores dejan de importar threading/concurrent para la orquestación:
+  piden un Ejecutor a paralelo.py y unos datos a recursos.py. Separación limpia.
+
+
+===============================================================================
+ RESUMEN EN UNA FRASE
+===============================================================================
+  recursos.py mide la máquina y decide cuántos hilos caben sin ahogarla;
+  paralelo.py los orquesta; el Punto 6 hace que las carpetas hermanas se
+  compriman a la vez; el Punto 5 junta el "polvo" de carpetas diminutas en un
+  solo ZIP para pagar menos coste por archivo. Todo automático, todo reanudable,
+  y en equipos antiguos cae con elegancia a secuencial + prioridad baja.

@@ -1,0 +1,32 @@
+# Build de Nuitka
+build/
+dist/
+*.build/
+*.dist/
+*.onefile-build/
+*.manifest
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tests
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# Estado/artefactos en tiempo de ejecución (progreso reanudable y cachés del árbol)
+_estado_zip.jsonl
+_arbol_zip.json
+.kakoli_combinacion.json
+.kakoli_combinacion_arbol.json
+.kakoli_aplanado.json
+.kakoli_aplanado_arbol.json
+.kakoli_desaplanado.json
+.kakoli_desaplanado_arbol.json
+PAUSA

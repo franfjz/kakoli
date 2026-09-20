@@ -1,0 +1,24 @@
+Fuentes de kakoli (registro en runtime)
+=======================================
+
+El tema (tema.py) intenta usar la fuente "Space Mono" del diseño. No viene con
+Windows, así que kakoli la registra al arrancar SOLO para su propio proceso
+(sin instalarla en el sistema ni pedir permisos de administrador).
+
+Para activarla:
+  1) Descarga Space Mono (SIL Open Font License) desde Google Fonts:
+       https://fonts.google.com/specimen/Space+Mono
+  2) Copia estos archivos .ttf dentro de esta carpeta (kakoli/fuentes/):
+       SpaceMono-Regular.ttf
+       SpaceMono-Bold.ttf
+       SpaceMono-Italic.ttf
+       SpaceMono-BoldItalic.ttf
+  3) Vuelve a abrir kakoli. El tema detectará la fuente y la usará.
+
+Si esta carpeta está vacía o falta algún archivo, kakoli sigue funcionando con
+la fuente de respaldo (Consolas y, si no, Courier New). No es obligatorio.
+
+Nota técnica: el registro lo hace tema.registrar_fuentes() con la API de Windows
+AddFontResourceExW en modo FR_PRIVATE (privado del proceso). Puedes dejar aquí
+cualquier .ttf/.otf y se registrará; el tema elegirá "Space Mono" si está, según
+el orden de preferencia de tema._FAMILIAS.

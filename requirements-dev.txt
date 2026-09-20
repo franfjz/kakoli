@@ -1,0 +1,8 @@
+# Dependencias SOLO de desarrollo (la app en sí no tiene dependencias externas).
+# Instalar en el venv del proyecto:  ./.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+#
+# El venv de desarrollo usa el Python 3.13 instalado en el equipo (decisión D14
+# de docs/REESTRUCTURACION.md); el código de la app debe seguir siendo compatible
+# con Python 3.11 (README).
+pytest>=8,<10
+pyflakes>=3,<4
